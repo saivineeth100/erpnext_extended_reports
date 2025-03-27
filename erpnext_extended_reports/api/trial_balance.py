@@ -3,7 +3,14 @@ import json
 from types import MethodType
 import frappe
 from frappe.database.query import QueryBuilder
-from frappe.query_builder import AliasedQuery, CustomFunction, Table, Case, Query
+from frappe.query_builder import (
+    AliasedQuery,
+    Criterion,
+    CustomFunction,
+    Table,
+    Case,
+    Query,
+)
 import frappe.query_builder
 import frappe.query_builder.builder
 from frappe.query_builder.functions import Sum, Count, Coalesce
@@ -13,8 +20,8 @@ from frappe.utils import get_table_name, getdate
 from erpnext_extended_reports import utils
 
 
-@frappe.whitelist(methods=["GET"])
-def get_trial_balance(company: str, hide_groups: bool = False):
+@frappe.whitelist(methods=["POST"])
+def ext_trial_balance(filters: dict = {}):
     """gets trial balance
 
     Args:
@@ -24,22 +31,24 @@ def get_trial_balance(company: str, hide_groups: bool = False):
     Returns:
         _type_: _description_
     """
-    data = get_tb_data_version_one(company, hide_groups)
+    data = get_tb_data_version_one(filters)
 
-    return {"data": []}
+    return data
 
 
 def get_tb_data_version_one(
-    company: str,
-    hide_groups: bool = False,
+    filters: dict = {},
 ):
-    """_summary_
-    in this method, I tried to create tb without touching closing balance doctype
+    """In this method, I tried to create tb without touching closing balance doctype
 
     Args:
         company (str): _description_
         hide_groups (bool, optional): _description_. Defaults to False.
     """
+    group_filter = filters.get("group", {"hide_groups": False, "flat": False})
+    hide_zero_accounts = filters.get("hide_zero_accounts", False)
+    hide_groups = group_filter.get("hide_groups")
+    company = filters.get("company")
     gl_entry = frappe.qb.DocType("GL Entry")
     account = frappe.qb.DocType("Account")
     gl_amount_fields = [
@@ -62,24 +71,27 @@ def get_tb_data_version_one(
         .where(gl_entry.company == company)
     ).groupby(gl_entry.account)
 
-    full_query_with_cte: QueryBuilder = frappe.qb.with_(amounts_query, "tb_non_grp")
+    final_cte_query: QueryBuilder = frappe.qb.with_(amounts_query, "tb_non_grp")
 
     tb_non_grp_aliased_query = AliasedQuery("tb_non_grp")
 
     tb_grp_aliased_query = None
 
     if not hide_groups:
-        full_query_with_cte = add_debit_credit_grps_query(full_query_with_cte, "tb_grp")
+        final_cte_query = add_debit_credit_grps_query(
+            final_cte_query, "tb_grp", company
+        )
         tb_grp_aliased_query = AliasedQuery("tb_grp")
 
-    full_query_with_cte = (
-        full_query_with_cte.from_(account)
+    final_cte_query = (
+        final_cte_query.from_(account)
         .left_outer_join(tb_non_grp_aliased_query)
         .on(tb_non_grp_aliased_query.account == account.name)
+        .where((account.company == company))
     )
-    select_fields = [account.name]
+    select_fields = [account.account_name.as_("name"), account.name.as_("id")]
     if hide_groups:
-        full_query_with_cte = full_query_with_cte.where(account.is_group == 0)
+        final_cte_query = final_cte_query.where(account.is_group == 0)
         select_fields = select_fields + [
             Coalesce(
                 tb_non_grp_aliased_query.opening_debits,
@@ -99,9 +111,9 @@ def get_tb_data_version_one(
             ).as_("credits"),
         ]
     else:
-        full_query_with_cte = full_query_with_cte.left_outer_join(
-            tb_grp_aliased_query
-        ).on(tb_grp_aliased_query.grp_name == account.name)
+        final_cte_query = final_cte_query.left_outer_join(tb_grp_aliased_query).on(
+            tb_grp_aliased_query.grp_name == account.name
+        )
         select_fields = select_fields + [
             Coalesce(
                 tb_grp_aliased_query.opening_debits,
@@ -130,27 +142,37 @@ def get_tb_data_version_one(
         account.root_type,
         account.report_type,
     ]
-    full_query_with_cte = full_query_with_cte.select(*select_fields)
+    final_cte_query = final_cte_query.select(*select_fields)
+    final_alias_query = AliasedQuery("combined_query")
+    final_query = frappe.qb.from_(final_alias_query).select("*")
 
-    # to get support of recursive cte
-    with utils.QueryBuilderWithSQLPatcher(full_query_with_cte):
-        # sql = full_query_with_cte.get_sql()
-        debits_credits = full_query_with_cte.run(as_dict=1)
-        f = open(
-            "/home/frappe/frappe-bench/apps/erpnext_extended_reports/erpnext_extended_reports/t.json",
-            "w",
+    with utils.QueryBuilderWithPatcher(final_query):
+        final_query = final_query.patched_with_(final_cte_query, final_alias_query.name)
+    if hide_zero_accounts:
+        final_query = final_query.where(
+            Criterion.all(
+                [
+                    (final_alias_query.opening_debits != 0),
+                    (final_alias_query.opening_credits != 0),
+                    (final_alias_query.debits != 0),
+                    (final_alias_query.credits != 0),
+                ]
+            )
         )
-        f.write(json.dumps(debits_credits))
-        f.close()
+    # to get support of recursive cte
+    with utils.QueryBuilderWithSQLPatcher(final_query):
+        # sql = final_query.get_sql()
+        tb_data = final_query.run(as_dict=1)
+        return tb_data
 
 
-def add_debit_credit_grps_query(query: QueryBuilder, name):
+def add_debit_credit_grps_query(query: QueryBuilder, query_name, company):
     gl_entry = frappe.qb.DocType("GL Entry")
     account = frappe.qb.DocType("Account")
 
     accounts_query = account.select(
         account.parent_account.as_("grp_name"), account.name.as_("account_name")
-    ).where(account.parent_account.notnull())
+    ).where((account.parent_account.notnull()) & (account.company == company))
 
     grp_accounts_query = account.as_("grp_accounts")
 
@@ -164,7 +186,10 @@ def add_debit_credit_grps_query(query: QueryBuilder, name):
             grp_accounts_query.parent_account.as_("grp_name"),
             account_hierarchy_alias_query.account_name,
         )
-        .where(grp_accounts_query.parent_account.notnull())
+        .where(
+            (grp_accounts_query.parent_account.notnull())
+            & (grp_accounts_query.company == company)
+        )
     )
     # query.with_ = classmethod(utils.with_)
 
@@ -193,5 +218,5 @@ def add_debit_credit_grps_query(query: QueryBuilder, name):
         )
         .groupby(account_hierarchy_alias_query.grp_name)
     )
-    query = query.with_(debits_credits_grps_query, name)
+    query = query.with_(debits_credits_grps_query, query_name)
     return query

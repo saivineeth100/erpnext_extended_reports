@@ -10,7 +10,7 @@ import types
 def mysql_with_sql(self, **kwargs) -> str:
     is_recursive = False
     for clause in self._with:
-        if isinstance(clause,WithQuery) and clause.is_recursive:
+        if isinstance(clause, WithQuery) and clause.is_recursive:
             is_recursive = True
             break
 
@@ -82,6 +82,15 @@ def with_(
 
 
 def mysqlbuiderwith_(self, selectable, name: str, is_recursive: bool = False):
+    """
+    if there is any selectable query contains with clause , will add that to self
+    as nested withs not allowed
+    """
+    if isinstance(selectable._with, list):
+        for clause in selectable._with:
+            self._with.append(clause)
+        selectable._with = []
+
     t = WithQuery(name, selectable, is_recursive)
     self._with.append(t)
 
